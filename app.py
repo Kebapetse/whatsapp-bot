@@ -1,6 +1,7 @@
 from flask import Flask, request
 from twilio.twiml.messaging_response import MessagingResponse
 from firebase_config import init_firestore
+from firebase_admin import firestore
 import logging
 import os
 import re
