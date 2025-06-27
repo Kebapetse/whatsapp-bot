@@ -38,7 +38,3 @@ Thumbs.db
 # Logs
 *.log
 logs/
-
-# Firebase
-firebase-key.json
-service-account-file.json

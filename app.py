@@ -1,10 +1,10 @@
 from flask import Flask, request
 from twilio.twiml.messaging_response import MessagingResponse
-from firebase_config import init_firestore
-from firebase_admin import firestore
+from database_config import get_db
 import logging
 import os
 import re
+from datetime import datetime
 
 app = Flask(__name__)
 
@@ -12,13 +12,8 @@ app = Flask(__name__)
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Initialize Firestore with error handling
-try:
-    db = init_firestore()
-    logger.info("Firestore initialized successfully")
-except Exception as e:
-    logger.error(f"Failed to initialize Firestore: {e}")
-    db = None
+# Get database manager
+db = get_db()
 
 # Store user registration sessions in memory
 user_sessions = {}
@@ -26,7 +21,17 @@ user_sessions = {}
 @app.route('/', methods=['GET'])
 def health_check():
     """Health check endpoint for Render"""
-    return {"status": "healthy", "service": "whatsapp-bot"}, 200
+    try:
+        business_count = db.get_business_count()
+        return {
+            "status": "healthy", 
+            "service": "whatsapp-bot",
+            "businesses_count": business_count,
+            "database": "sqlite"
+        }, 200
+    except Exception as e:
+        logger.error(f"Health check failed: {e}")
+        return {"status": "unhealthy", "error": str(e)}, 500
 
 def validate_phone(phone):
     """Validate phone number format"""
@@ -52,11 +57,6 @@ def whatsapp_webhook():
         
         resp = MessagingResponse()
 
-        # Check if database is available
-        if not db:
-            resp.message("Sorry, the service is temporarily unavailable. Please try again later.")
-            return str(resp)
-
         # Handle empty message
         if not body:
             resp.message("👋 Welcome to Business Directory!\n\n🔍 *Search*: Send keywords like 'pizza', 'hotel'\n📝 *Register*: Send 'register' to add your business\n❓ *Help*: Send 'help' for more options")
@@ -79,13 +79,18 @@ Send keywords like:
 • pharmacy, medicine
 • repair, tech, service
 
+📍 *SEARCH BY LOCATION:*
+• "near downtown" - Find businesses near downtown
+• "near airport" - Find businesses near airport
+
 📝 *REGISTER YOUR BUSINESS:*
 • Send 'register' to add your business
 • It's FREE and takes 2 minutes!
 
 ❓ *OTHER COMMANDS:*
 • 'help' - Show this menu
-• 'contact' - Get support"""
+• 'contact' - Get support
+• 'stats' - Directory statistics"""
             resp.message(help_message)
             return str(resp)
 
@@ -95,6 +100,13 @@ Send keywords like:
         elif body_lower == 'contact':
             resp.message("📞 *Need Help?*\n\nFor support or questions:\n• Email: support@yourdomain.com\n• Reply 'help' for commands")
             return str(resp)
+        
+        elif body_lower == 'stats':
+            return show_statistics(resp)
+        
+        elif body_lower.startswith('near '):
+            location = body_lower[5:].strip()  # Remove 'near ' prefix
+            return search_by_location(location, resp)
 
         # Default: Search for businesses
         else:
@@ -104,6 +116,81 @@ Send keywords like:
         logger.error(f"Webhook error: {e}")
         resp = MessagingResponse()
         resp.message("Sorry, something went wrong. Please try again or send 'help' for assistance.")
+        return str(resp)
+
+def show_statistics(resp):
+    """Show directory statistics"""
+    try:
+        total_count = db.get_business_count()
+        recent_businesses = db.get_recent_businesses(3)
+        popular_keywords = db.get_popular_keywords(5)
+        
+        stats_message = f"📊 *Directory Statistics*\n\n"
+        stats_message += f"🏢 Total Businesses: {total_count}\n\n"
+        
+        if recent_businesses:
+            stats_message += "🆕 *Recently Added:*\n"
+            for business in recent_businesses:
+                # Format the datetime
+                reg_date = business['registered_at']
+                if isinstance(reg_date, str):
+                    reg_date = datetime.fromisoformat(reg_date.replace('Z', '+00:00'))
+                formatted_date = reg_date.strftime('%b %d')
+                stats_message += f"• {business['name']} ({formatted_date})\n"
+        
+        if popular_keywords:
+            stats_message += f"\n🔥 *Popular Categories:*\n"
+            for kw in popular_keywords:
+                stats_message += f"• {kw['keyword']} ({kw['count']})\n"
+        
+        stats_message += f"\n💡 Send 'register' to add your business FREE!"
+        
+        resp.message(stats_message)
+        return str(resp)
+        
+    except Exception as e:
+        logger.error(f"Error showing statistics: {e}")
+        resp.message("📊 Directory is growing daily!\n\n💡 Send 'register' to add your business FREE!")
+        return str(resp)
+
+def search_by_location(location, resp):
+    """Search for businesses by location"""
+    try:
+        results = db.search_by_location(location, limit=10)
+        
+        if results:
+            reply = f"📍 Found {len(results)} business(es) near '{location}':\n\n"
+            for i, business in enumerate(results[:5], 1):
+                name = business.get('name', 'Unknown Business')
+                address = business.get('address', 'Address not available')
+                phone = business.get('phone', 'Phone not available')
+                keywords = business.get('keywords', [])
+                
+                reply += f"{i}. *{name}*\n"
+                reply += f"📍 {address}\n"
+                reply += f"📞 {phone}\n"
+                if keywords:
+                    reply += f"🏷️ {', '.join(keywords[:3])}\n"
+                reply += "\n"
+            
+            if len(results) > 5:
+                reply += f"... and {len(results) - 5} more results.\n\n"
+                
+            reply += "💡 Try searching by business type too!"
+        else:
+            reply = f"""📍 No businesses found near '{location}'.
+
+💡 *Try searching by:*
+• Business type: restaurant, hotel, pharmacy
+• Different location: downtown, airport, mall
+• Send 'register' to add your business"""
+
+        resp.message(reply)
+        return str(resp)
+
+    except Exception as e:
+        logger.error(f"Location search error: {e}")
+        resp.message("Sorry, there was an error searching by location. Please try again.")
         return str(resp)
 
 def start_registration(from_number, resp):
@@ -223,21 +310,18 @@ def complete_registration(from_number, resp):
         session = user_sessions[from_number]
         business_data = session['data']
         
-        # Prepare data for Firestore
+        # Prepare data for database
         business_doc = {
             'name': business_data['name'],
-            'name_lower': business_data['name'].lower(),
             'address': business_data['address'],
             'phone': business_data['phone'],
             'email': business_data['email'],
             'keywords': business_data['keywords'],
-            'registered_by': from_number,
-            'registered_at': firestore.SERVER_TIMESTAMP,
-            'status': 'active'
+            'registered_by': from_number
         }
         
-        # Add to Firestore
-        db.collection('businesses').add(business_doc)
+        # Add to database
+        business_id = db.add_business(business_doc)
         
         # Clean up session
         del user_sessions[from_number]
@@ -260,11 +344,13 @@ Your business has been added to our directory:
 • Tell them to search: {business_data['keywords'][0]}
 • Need changes? Contact support
 
-Thank you for joining our directory! 🙏"""
+Thank you for joining our directory! 🙏
+
+Business ID: #{business_id}"""
         
         resp.message(confirmation)
         
-        logger.info(f"New business registered: {business_data['name']} by {from_number}")
+        logger.info(f"New business registered: {business_data['name']} (ID: {business_id}) by {from_number}")
         
     except Exception as e:
         logger.error(f"Registration completion error: {e}")
@@ -278,29 +364,11 @@ Thank you for joining our directory! 🙏"""
 def search_businesses(query, resp):
     """Search for businesses based on query"""
     try:
-        # Search in multiple fields for better results
-        results = []
+        results = db.search_businesses(query, limit=10)
         
-        # Search by keywords array
-        keyword_results = db.collection('businesses').where('keywords', 'array_contains', query).where('status', '==', 'active').limit(10).stream()
-        results.extend([doc.to_dict() for doc in keyword_results])
-        
-        # Also search by business name (case-insensitive)
-        name_results = db.collection('businesses').where('name_lower', '>=', query).where('name_lower', '<=', query + '\uf8ff').where('status', '==', 'active').limit(5).stream()
-        results.extend([doc.to_dict() for doc in name_results])
-        
-        # Remove duplicates based on business name
-        seen_names = set()
-        unique_results = []
-        for business in results:
-            name = business.get('name', 'Unknown Business')
-            if name not in seen_names:
-                seen_names.add(name)
-                unique_results.append(business)
-        
-        if unique_results:
-            reply = f"🔍 Found {len(unique_results)} business(es) for '{query}':\n\n"
-            for i, business in enumerate(unique_results[:5], 1):  # Limit to 5 results
+        if results:
+            reply = f"🔍 Found {len(results)} business(es) for '{query}':\n\n"
+            for i, business in enumerate(results[:5], 1):  # Limit to 5 results for WhatsApp
                 name = business.get('name', 'Unknown Business')
                 address = business.get('address', 'Address not available')
                 phone = business.get('phone', 'Phone not available')
@@ -313,8 +381,8 @@ def search_businesses(query, resp):
                     reply += f"📧 {email}\n"
                 reply += "\n"
             
-            if len(unique_results) > 5:
-                reply += f"... and {len(unique_results) - 5} more results.\n\n"
+            if len(results) > 5:
+                reply += f"... and {len(results) - 5} more results.\n\n"
             
             reply += "💡 Can't find what you're looking for?\n• Try different keywords\n• Send 'register' to add your business"
         else:

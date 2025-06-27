@@ -2,14 +2,16 @@ services:
   - type: web
     name: whatsapp-bot
     env: python
-    region: oregon  # Choose region closest to your users
+    region: frankfurt  # Choose region closest to your users
     plan: free
     buildCommand: pip install -r requirements.txt
     startCommand: gunicorn --bind 0.0.0.0:$PORT app:app --workers 2 --timeout 30
     healthCheckPath: /
     envVars:
-      - key: FIREBASE_JSON
-        sync: false  # Set this manually on Render dashboard for security
+      - key: DATABASE_URL
+        fromDatabase:
+          name: whatsapp-bot-db
+          property: connectionString
       - key: TWILIO_ACCOUNT_SID
         sync: false  # Set this manually on Render dashboard for security
       - key: TWILIO_AUTH_TOKEN
@@ -20,3 +22,10 @@ services:
         value: .
     # Auto-deploy from your git repository
     autoDeploy: true
+
+databases:
+  - name: whatsapp-bot-db
+    databaseName: whatsapp_directory
+    user: whatsapp_user
+    region: oregon  # Same region as web service for better performance
+    plan: free  # Render provides 1GB PostgreSQL free tier
